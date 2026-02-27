@@ -60,6 +60,35 @@ async function sbFetch(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
+// Upload a file to Supabase Storage and return its public URL
+async function uploadToStorage(dataUrl, fileName, mimeType) {
+  const base64 = dataUrl.split(",")[1];
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  // Sanitize filename and make path unique
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = `${Date.now()}-${safeName}`;
+
+  const res = await fetch(`${SB_URL}/storage/v1/object/mail-files/${path}`, {
+    method: "POST",
+    headers: {
+      "apikey": SB_KEY,
+      "Authorization": `Bearer ${SB_KEY}`,
+      "Content-Type": mimeType,
+    },
+    body: bytes,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Storage upload failed");
+  }
+
+  return `${SB_URL}/storage/v1/object/public/mail-files/${path}`;
+}
+
 const STATUS_FLOW = ["Received", "Processing", "Closed"];
 const STATUS_COLORS = { "Received": "#4ade80", "Processing": "#facc15", "Closed": "#a78bfa" };
 const STATUS_ICONS = { "Received": "⬛", "Processing": "⚙", "Closed": "✓" };
@@ -90,7 +119,8 @@ Respond ONLY with valid JSON like:
 
 If you cannot determine a field with confidence, use an empty string "". Do not guess.`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  // Call our secure server-side proxy instead of Anthropic directly
+  const response = await fetch("/api/scan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -110,6 +140,7 @@ If you cannot determine a field with confidence, use an empty string "". Do not 
 function DocViewer({ dataUrl, fileInfo, onClose }) {
   const isImage = fileInfo?.type?.startsWith("image/");
   const isPDF = fileInfo?.type === "application/pdf";
+  const isRemoteUrl = dataUrl?.startsWith("http");
   const [pages, setPages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -126,7 +157,6 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
 
     async function renderPDF() {
       try {
-        // Load PDF.js from CDN
         if (!window.pdfjsLib) {
           await new Promise((res, rej) => {
             const s = document.createElement("script");
@@ -138,14 +168,20 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
             "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
         }
 
-        const base64 = dataUrl.split(",")[1];
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        // Use URL directly for remote files, bytes for data URLs
+        let pdfSource;
+        if (isRemoteUrl) {
+          pdfSource = { url: dataUrl };
+        } else {
+          const base64 = dataUrl.split(",")[1];
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          pdfSource = { data: bytes };
+        }
 
-        const pdf = await window.pdfjsLib.getDocument({ data: bytes }).promise;
+        const pdf = await window.pdfjsLib.getDocument(pdfSource).promise;
         const rendered = [];
-
         for (let p = 1; p <= pdf.numPages; p++) {
           const page = await pdf.getPage(p);
           const viewport = page.getViewport({ scale: 1.5 });
@@ -156,7 +192,6 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
           await page.render({ canvasContext: ctx, viewport }).promise;
           rendered.push(canvas.toDataURL());
         }
-
         setPages(rendered);
         setLoading(false);
       } catch (err) {
@@ -164,14 +199,13 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
         setLoading(false);
       }
     }
-
     renderPDF();
   }, [dataUrl, isPDF]);
 
-  // Blob URL only needed for image src and download
+  // For non-remote data URLs, create a blob URL for image display & download
   const [blobUrl, setBlobUrl] = useState(null);
   useEffect(() => {
-    if (!dataUrl) return;
+    if (!dataUrl || isRemoteUrl) { setBlobUrl(dataUrl); return; }
     try {
       const [header, base64] = dataUrl.split(",");
       const mime = header.match(/:(.*?);/)[1];
@@ -185,15 +219,11 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
     } catch { setBlobUrl(dataUrl); }
   }, [dataUrl]);
 
-  return (
-    <div style={{
-      position: "fixed", inset: 0, zIndex: 9999,
-      background: "rgba(0,0,0,0.95)",
-      display: "flex", flexDirection: "column",
-      animation: "fadeIn 0.2s ease"
-    }} onClick={e => e.target === e.currentTarget && onClose()}>
+  const displayUrl = isRemoteUrl ? dataUrl : blobUrl;
 
-      {/* Header */}
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "rgba(0,0,0,0.95)", display: "flex", flexDirection: "column", animation: "fadeIn 0.2s ease" }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
       <div style={{ background: "#0d0d0d", borderBottom: "1px solid #1a1a1a", padding: "0 24px", height: 52, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <span style={{ fontSize: 16, color: "#a78bfa" }}>📎</span>
@@ -202,8 +232,9 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
           {isPDF && pages.length > 0 && <span style={{ fontSize: 10, color: "#555", letterSpacing: 1 }}>{pages.length} page{pages.length !== 1 ? "s" : ""}</span>}
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          {blobUrl && (
-            <a href={blobUrl} download={fileInfo?.name} style={{ padding: "5px 14px", background: "transparent", color: "#888", border: "1px solid #2a2a2a", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", fontFamily: "'Share Tech Mono', monospace", textDecoration: "none" }}>
+          {displayUrl && (
+            <a href={displayUrl} download={!isRemoteUrl ? fileInfo?.name : undefined} target={isRemoteUrl ? "_blank" : undefined} rel="noreferrer"
+              style={{ padding: "5px 14px", background: "transparent", color: "#888", border: "1px solid #2a2a2a", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", fontFamily: "'Share Tech Mono', monospace", textDecoration: "none" }}>
               ↓ DOWNLOAD
             </a>
           )}
@@ -212,40 +243,26 @@ function DocViewer({ dataUrl, fileInfo, onClose }) {
           </button>
         </div>
       </div>
-
-      {/* Body */}
-      <div ref={containerRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", alignItems: "center", padding: "24px", gap: 16 }}>
-        {loading && (
-          <div style={{ color: "#555", fontFamily: "'Share Tech Mono', monospace", fontSize: 12, letterSpacing: 2, marginTop: 80 }}>
-            <span style={{ display: "inline-block", animation: "spin 1.5s linear infinite", marginRight: 10 }}>◈</span>
-            RENDERING PDF...
-          </div>
-        )}
+      <div ref={containerRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", alignItems: "center", padding: 24, gap: 16 }}>
+        {loading && <div style={{ color: "#555", fontFamily: "'Share Tech Mono', monospace", fontSize: 12, letterSpacing: 2, marginTop: 80 }}><span style={{ display: "inline-block", animation: "spin 1.5s linear infinite", marginRight: 10 }}>◈</span>RENDERING PDF...</div>}
         {error && (
           <div style={{ color: "#f87171", fontFamily: "'Share Tech Mono', monospace", fontSize: 12, letterSpacing: 1, marginTop: 80, textAlign: "center" }}>
-            <div style={{ fontSize: 28, marginBottom: 12 }}>⚠</div>
-            {error}
-            {blobUrl && <div style={{ marginTop: 16 }}><a href={blobUrl} download={fileInfo?.name} style={{ color: "#60a5fa", fontSize: 11, letterSpacing: 1 }}>↓ DOWNLOAD FILE</a></div>}
+            <div style={{ fontSize: 28, marginBottom: 12 }}>⚠</div>{error}
+            {displayUrl && <div style={{ marginTop: 16 }}><a href={displayUrl} target="_blank" rel="noreferrer" style={{ color: "#60a5fa", fontSize: 11, letterSpacing: 1 }}>↓ OPEN FILE</a></div>}
           </div>
         )}
         {isPDF && !loading && !error && pages.map((src, i) => (
           <div key={i} style={{ position: "relative", boxShadow: "0 4px 32px rgba(0,0,0,0.6)" }}>
-            {pages.length > 1 && (
-              <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(0,0,0,0.6)", color: "#888", fontFamily: "'Share Tech Mono', monospace", fontSize: 10, padding: "2px 8px", letterSpacing: 1 }}>
-                {i + 1} / {pages.length}
-              </div>
-            )}
+            {pages.length > 1 && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(0,0,0,0.6)", color: "#888", fontFamily: "'Share Tech Mono', monospace", fontSize: 10, padding: "2px 8px" }}>{i + 1} / {pages.length}</div>}
             <img src={src} alt={`Page ${i + 1}`} style={{ display: "block", maxWidth: "min(900px, 100%)", border: "1px solid #2a2a2a" }} />
           </div>
         ))}
-        {isImage && blobUrl && (
-          <img src={blobUrl} alt={fileInfo?.name} style={{ maxWidth: "min(900px, 100%)", objectFit: "contain", border: "1px solid #1a1a1a", boxShadow: "0 4px 32px rgba(0,0,0,0.6)" }} />
-        )}
-        {!isPDF && !isImage && blobUrl && (
+        {isImage && displayUrl && <img src={displayUrl} alt={fileInfo?.name} style={{ maxWidth: "min(900px, 100%)", objectFit: "contain", border: "1px solid #1a1a1a", boxShadow: "0 4px 32px rgba(0,0,0,0.6)" }} />}
+        {!isPDF && !isImage && displayUrl && (
           <div style={{ textAlign: "center", color: "#555", fontFamily: "'Share Tech Mono', monospace", marginTop: 80 }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>📎</div>
             <div style={{ fontSize: 12, letterSpacing: 2 }}>PREVIEW NOT AVAILABLE</div>
-            <a href={blobUrl} download={fileInfo?.name} style={{ color: "#60a5fa", fontSize: 11, marginTop: 16, display: "inline-block", letterSpacing: 1 }}>↓ DOWNLOAD FILE</a>
+            <a href={displayUrl} target="_blank" rel="noreferrer" style={{ color: "#60a5fa", fontSize: 11, marginTop: 16, display: "inline-block", letterSpacing: 1 }}>↓ OPEN FILE</a>
           </div>
         )}
       </div>
@@ -265,6 +282,7 @@ export default function MailTracker() {
   const [scanResult, setScanResult] = useState(null);
   const [filter, setFilter] = useState("All");
   const [search, setSearch] = useState("");
+  const [sortOrder, setSortOrder] = useState("newest"); // "newest" | "oldest"
   const [toast, setToast] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -377,10 +395,22 @@ export default function MailTracker() {
       return;
     }
     const id = generateTrackingNumber();
+
+    // Upload file to Supabase Storage if present
+    let storedFileUrl = null;
+    if (fileDataUrl && fileInfo) {
+      try {
+        showToast("Uploading file...", "info");
+        storedFileUrl = await uploadToStorage(fileDataUrl, fileInfo.name, fileInfo.type);
+      } catch (e) {
+        showToast("File upload failed — mail will be saved without attachment.", "warn");
+      }
+    }
+
     const newMail = {
       id, ...form,
       file: fileInfo,
-      fileDataUrl: fileDataUrl || null,
+      fileDataUrl: storedFileUrl,
       aiScanned: scanResult === "success",
       status: "Received",
       history: [{ status: "Received", time: new Date().toISOString(), note: "Mail received and logged." }],
@@ -482,14 +512,20 @@ export default function MailTracker() {
     }
   }
 
-  const filtered = mails.filter(m => {
-    const matchFilter = filter === "All" || m.status === filter;
-    const matchSearch = !search || m.id.includes(search.toUpperCase()) ||
-      m.sender.toLowerCase().includes(search.toLowerCase()) ||
-      m.recipient.toLowerCase().includes(search.toLowerCase()) ||
-      (m.subject || "").toLowerCase().includes(search.toLowerCase());
-    return matchFilter && matchSearch;
-  });
+  const filtered = mails
+    .filter(m => {
+      const matchFilter = filter === "All" || m.status === filter;
+      const matchSearch = !search || m.id.includes(search.toUpperCase()) ||
+        m.sender.toLowerCase().includes(search.toLowerCase()) ||
+        m.recipient.toLowerCase().includes(search.toLowerCase()) ||
+        (m.subject || "").toLowerCase().includes(search.toLowerCase());
+      return matchFilter && matchSearch;
+    })
+    .sort((a, b) => {
+      const ta = new Date(a.createdAt).getTime();
+      const tb = new Date(b.createdAt).getTime();
+      return sortOrder === "newest" ? tb - ta : ta - tb;
+    });
   const counts = STATUS_FLOW.reduce((acc, s) => { acc[s] = mails.filter(m => m.status === s).length; return acc; }, {});
 
   return (
@@ -601,6 +637,14 @@ export default function MailTracker() {
                   }}>{f}</button>
                 ))}
               </div>
+              <button className="btn" onClick={() => setSortOrder(s => s === "newest" ? "oldest" : "newest")} style={{
+                padding: "8px 14px", background: "transparent", color: "#888",
+                border: "1px solid #2a2a2a", fontSize: 10, letterSpacing: 2,
+                textTransform: "uppercase", fontFamily: "'Share Tech Mono', monospace",
+                whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 6
+              }}>
+                {sortOrder === "newest" ? "↓ NEWEST" : "↑ OLDEST"}
+              </button>
               <button className="btn" onClick={() => {
                 const today = new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
                 const subject = encodeURIComponent(`MailTrack Daily Summary — ${today}`);
@@ -636,7 +680,15 @@ Sent from MailTrack`
             ) : (
               <div style={{ border: "1px solid #1a1a1a" }}>
                 <div style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr 1.5fr 1.5fr 1fr 1fr 0.4fr", padding: "10px 16px", background: "#0d0d0d", borderBottom: "1px solid #1a1a1a", fontSize: 10, color: "#444", letterSpacing: 2, textTransform: "uppercase" }}>
-                  <span>Tracking ID</span><span>From</span><span>To</span><span>Subject</span><span>Status</span><span>Updated</span><span></span>
+                  <span>Tracking ID</span><span>From</span><span>To</span><span>Subject</span><span>Status</span>
+                  <span
+                    onClick={() => setSortOrder(s => s === "newest" ? "oldest" : "newest")}
+                    style={{ cursor: "pointer", color: "#666", display: "flex", alignItems: "center", gap: 4 }}
+                    title="Click to toggle sort order"
+                  >
+                    Date Added {sortOrder === "newest" ? "↓" : "↑"}
+                  </span>
+                  <span></span>
                 </div>
                 {filtered.map(mail => (
                   <div key={mail.id} className="mail-row" style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr 1.5fr 1.5fr 1fr 1fr 0.4fr", padding: "13px 16px", borderBottom: "1px solid #111", background: "#0a0a0a", alignItems: "center" }}
@@ -646,7 +698,7 @@ Sent from MailTrack`
                     <span style={{ fontSize: 12, color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{mail.recipient}</span>
                     <span style={{ fontSize: 12, color: "#666", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{mail.subject || "—"}</span>
                     <span style={{ fontSize: 10, color: STATUS_COLORS[mail.status], background: `${STATUS_COLORS[mail.status]}15`, padding: "3px 8px", letterSpacing: 1, whiteSpace: "nowrap" }}>{mail.status.toUpperCase()}</span>
-                    <span style={{ fontSize: 10, color: "#444" }}>{formatDate(mail.updatedAt)}</span>
+                    <span style={{ fontSize: 10, color: "#444" }}>{formatDate(mail.createdAt)}</span>
                     <span title={mail.aiScanned ? "AI Scanned" : ""} style={{ fontSize: 10, color: "#60a5fa", textAlign: "right" }}>{mail.aiScanned ? "◈" : ""}</span>
                   </div>
                 ))}
